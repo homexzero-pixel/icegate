@@ -7,7 +7,8 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
-const { buildDemo } = require('./lib/demo');
+const { buildDemoDocuments } = require('./lib/demo');
+const { analyze } = require('./lib/analytics');
 const { normalize } = require('./lib/normalize');
 
 loadDotEnv(path.join(__dirname, '.env'));
@@ -17,39 +18,42 @@ const API_BASE = (process.env.ICEGATE_API_BASE || '').replace(/\/+$/, '');
 const API_KEY = process.env.ICEGATE_API_KEY || '';
 const API_KEY_HEADER = process.env.ICEGATE_API_KEY_HEADER || 'Authorization';
 const API_KEY_PREFIX = process.env.ICEGATE_API_KEY_PREFIX ?? 'Bearer';
-const API_PATH = process.env.ICEGATE_API_PATH || '/dashboard';
+const API_PATH = process.env.ICEGATE_API_PATH || '/documents';
 const CACHE_MS = (Number(process.env.CACHE_SECONDS) || 60) * 1000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
-const ALLOWED_DAYS = new Set([7, 30, 90]);
+const ALLOWED_DAYS = new Set([30, 90, 180, 365]);
 
-const cache = new Map();
+let docCache = null;
 
-async function getDashboard(days) {
-  const hit = cache.get(days);
-  if (hit && Date.now() - hit.at < CACHE_MS) return hit.data;
-
-  let data;
+// Fetch (or build) the document list once per CACHE_SECONDS; every range is
+// analysed from the same list so switching ranges is instant and consistent.
+async function getDocuments() {
+  if (docCache && Date.now() - docCache.at < CACHE_MS) return docCache;
+  let entry;
   if (API_BASE && API_KEY) {
     try {
-      data = { ...normalize(await fetchLive(days)), source: 'live' };
+      entry = { docs: normalize(await fetchLive()), source: 'live' };
     } catch (err) {
       console.error(`[icegate] live fetch failed: ${err.message}`);
-      data = { ...buildDemo(days), source: 'demo', notice: `Live API unavailable (${err.message}). Showing demo data.` };
+      entry = { docs: buildDemoDocuments(), source: 'demo', notice: `Live API unavailable (${err.message}). Showing demo data.` };
     }
   } else {
-    data = { ...buildDemo(days), source: 'demo', notice: 'ICEGATE_API_BASE / ICEGATE_API_KEY not set. Showing demo data.' };
+    entry = { docs: buildDemoDocuments(), source: 'demo', notice: 'ICEGATE_API_BASE / ICEGATE_API_KEY not set. Showing demo data.' };
   }
-  data.days = days;
-  data.generatedAt = new Date().toISOString();
-  cache.set(days, { at: Date.now(), data });
-  return data;
+  docCache = { ...entry, at: Date.now() };
+  return docCache;
 }
 
-async function fetchLive(days) {
-  const url = `${API_BASE}${API_PATH}?days=${days}`;
+async function getDashboard(days) {
+  const { docs, source, notice, at } = await getDocuments();
+  return { ...analyze(docs, days), source, notice, generatedAt: new Date(at).toISOString() };
+}
+
+async function fetchLive() {
+  const url = `${API_BASE}${API_PATH}`;
   const headers = { Accept: 'application/json' };
   headers[API_KEY_HEADER] = API_KEY_PREFIX ? `${API_KEY_PREFIX} ${API_KEY}` : API_KEY;
-  const res = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+  const res = await fetch(url, { headers, signal: AbortSignal.timeout(30000) });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
@@ -66,8 +70,8 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   try {
     if (url.pathname === '/api/dashboard') {
-      const days = Number(url.searchParams.get('days')) || 30;
-      if (!ALLOWED_DAYS.has(days)) return send(res, 400, { error: 'days must be 7, 30 or 90' });
+      const days = Number(url.searchParams.get('days')) || 90;
+      if (!ALLOWED_DAYS.has(days)) return send(res, 400, { error: 'days must be 30, 90, 180 or 365' });
       return send(res, 200, await getDashboard(days));
     }
     if (url.pathname === '/api/health') return send(res, 200, { ok: true, live: Boolean(API_BASE && API_KEY) });
